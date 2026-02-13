@@ -45,10 +45,11 @@ Tests the async PDF ingestion API by uploading PDFs in a single API call, pollin
 
 ### How It Works
 
-1. Sends all PDFs in **one API call** (server handles everything in one background job)
-2. Polls `GET /api/v1/ingest/status/{jobId}` until `COMPLETED` or `FAILED`
-3. Reports ingestion summary (docs, chunks, time, rate)
-4. Optionally verifies the exported JSON structure
+1. For **<= 100 PDFs**: sends all in **one API call** (one server job, one export file)
+2. For **> 100 PDFs**: auto-batches into 100-PDF chunks (one job per batch, one export per batch)
+3. Polls `GET /api/v1/ingest/status/{jobId}` until `COMPLETED` or `FAILED`
+4. Reports ingestion summary (docs, chunks, time, rate)
+5. Optionally verifies the exported JSON structure
 
 ### Usage
 
@@ -58,10 +59,10 @@ cd api-test
 # Quick smoke test (5 PDFs)
 python test_async_ingestion.py
 
-# 50 PDFs
+# 50 PDFs (single API call)
 python test_async_ingestion.py --count 50
 
-# Full dataset (1082 PDFs)
+# Full dataset (auto-batched: 11 batches of 100)
 python test_async_ingestion.py --count 1082
 
 # Verify JSON export after ingestion
@@ -88,13 +89,23 @@ python test_async_ingestion.py --count 50 --skip-validation-tests
 | `single_file` | Upload 1 PDF, poll until COMPLETED |
 | `ingestion` | Upload N PDFs in single call, poll until COMPLETED |
 
+### Auto-Batching
+
+| Count | Behavior |
+|---|---|
+| `--count 50` | 1 API call, 1 job, 1 export file |
+| `--count 200` | 2 API calls (100+100), 2 jobs, 2 export files |
+| `--count 1082` | 11 API calls (10x100 + 1x82), 11 jobs, 11 export files |
+
+Each batch is <= 100 PDFs (~400 MB) to avoid HTTP upload timeouts. Each batch is still one server job producing one export JSON file.
+
 ### Sample Output
 
 ```
 [INFO] Server is UP
-[INFO] Found 1082 PDFs in .../Research-Paper-Downloder/data/arxiv/cs_ai/pdfs
 [INFO] PASS - Got 404 for unknown jobId
 [INFO] PASS - Got 400 for non-PDF file
+[INFO] TEST: Ingest 50 PDFs (single API call)
 [INFO] Uploading 50 PDFs (175.5 MB) in a single API call...
 [INFO] Job submitted: job_1c98a739-737
 [INFO]   [COMPLETED] docs: 50/50, chunks: 1443
@@ -105,7 +116,8 @@ python test_async_ingestion.py --count 50 --skip-validation-tests
 [INFO] PDFs uploaded:     50
 [INFO] Documents indexed: 50
 [INFO] Total chunks:      1443
-[INFO] Export file:       2026-02-12T19-14-54-571.json
+[INFO] Jobs completed:    1/1
+[INFO] Export files:      1
 [INFO] Total time:        40.7s
 [INFO] Rate:              1.2 PDFs/sec
 [INFO] ============================================================

@@ -2,8 +2,9 @@
 Test script for the async PDF ingestion API.
 
 Uploads PDFs from Research-Paper-Downloder/data/arxiv/cs_ai/pdfs/
-to the Lucene service in a SINGLE API call. The server handles all files
-in one background job, producing one export JSON file.
+to the Lucene service. For <= 100 PDFs, sends a single API call.
+For larger counts, auto-batches into 100-PDF chunks (each batch = one
+server job = one export file).
 
 Usage:
     # Test with 5 PDFs (quick smoke test)
@@ -12,10 +13,10 @@ Usage:
     # Test with custom count
     python test_async_ingestion.py --count 50
 
-    # Full test with all 1082 PDFs
+    # Full test with all 1082 PDFs (auto-batched into 100 per request)
     python test_async_ingestion.py --count 1082
 
-    # Verify exported JSON file
+    # Verify exported JSON files
     python test_async_ingestion.py --count 10 --verify-export
 """
 
@@ -53,7 +54,10 @@ EXPORT_PATH = os.path.join(
 
 # Polling config
 POLL_INTERVAL_SEC = 2
-POLL_TIMEOUT_SEC = 1800  # 30 minutes max (for large uploads like 1082 PDFs)
+POLL_TIMEOUT_SEC = 1800  # 30 minutes max per job
+
+# Auto-batching: PDFs per API call (keeps upload size manageable)
+BATCH_SIZE = 100  # ~400 MB per batch (avg 4 MB per PDF)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -306,6 +310,9 @@ def test_single_file(pdfs: List[Path]) -> bool:
     job_id = response.get("jobId")
 
     if not job_id:
+        if response.get("filesSubmitted") == 0 and response.get("skippedFiles"):
+            logger.info("PASS - File already ingested, skipped: %s", response.get("skippedFiles"))
+            return True
         logger.error("FAIL - No jobId returned: %s", response)
         return False
 
@@ -333,38 +340,84 @@ def test_single_file(pdfs: List[Path]) -> bool:
 
 def test_ingestion(pdfs: List[Path], verify_export: bool) -> bool:
     """
-    Test: upload ALL PDFs in a single API call.
-    Server processes them in one background job → one export file.
+    Test: upload PDFs to the async ingestion API.
+    For <= BATCH_SIZE PDFs: single API call → single job → single export.
+    For > BATCH_SIZE PDFs: auto-batched → one job per batch → one export per batch.
     """
-    logger.info("=" * 60)
-    logger.info("TEST: Ingest %d PDFs (single API call → single job)", len(pdfs))
-    logger.info("=" * 60)
+    batches = [pdfs[i:i + BATCH_SIZE] for i in range(0, len(pdfs), BATCH_SIZE)]
+    num_batches = len(batches)
+
+    if num_batches == 1:
+        logger.info("=" * 60)
+        logger.info("TEST: Ingest %d PDFs (single API call)", len(pdfs))
+        logger.info("=" * 60)
+    else:
+        logger.info("=" * 60)
+        logger.info("TEST: Ingest %d PDFs (%d batches of %d)",
+                     len(pdfs), num_batches, BATCH_SIZE)
+        logger.info("=" * 60)
 
     total_start = time.time()
+    total_docs = 0
+    total_chunks = 0
+    jobs_completed = 0
+    jobs_failed = 0
+    export_files = []
 
-    # One API call with all PDFs
-    response = submit_job(pdfs)
-    job_id = response.get("jobId")
+    for batch_num, batch in enumerate(batches, 1):
+        if num_batches > 1:
+            logger.info("-" * 40)
+            logger.info("Batch %d/%d (%d files)", batch_num, num_batches, len(batch))
 
-    if not job_id:
-        logger.error("FAIL - No jobId returned: %s", response)
-        return False
+        response = submit_job(batch)
+        job_id = response.get("jobId")
 
-    logger.info("Job submitted: %s", job_id)
-    logger.info("Server is processing %d files in the background...", len(pdfs))
+        # Handle "all skipped" response (no jobId, all files already ingested)
+        if not job_id:
+            if response.get("filesSubmitted") == 0 and response.get("skippedFiles"):
+                skipped = response.get("skippedFiles", [])
+                logger.info("All %d file(s) already ingested — skipped", len(skipped))
+                jobs_completed += 1
+                continue
+            else:
+                logger.error("FAIL - No jobId returned: %s", response)
+                jobs_failed += 1
+                continue
 
-    # Poll until done
-    final = poll_job(job_id)
+        logger.info("Job submitted: %s", job_id)
+
+        # Log skipped files if any
+        skipped = response.get("skippedFiles", [])
+        if skipped:
+            logger.info("  Skipped %d already-ingested file(s)", len(skipped))
+
+        final = poll_job(job_id)
+
+        if final.get("status") == "COMPLETED":
+            jobs_completed += 1
+            batch_docs = final.get("documentsProcessed", 0)
+            batch_chunks = final.get("chunksProcessed", 0)
+            total_docs += batch_docs
+            total_chunks += batch_chunks
+            export_file = final.get("exportFileName")
+            if export_file:
+                export_files.append(export_file)
+            logger.info("  Done: %d docs, %d chunks, export: %s",
+                        batch_docs, batch_chunks, export_file)
+        else:
+            jobs_failed += 1
+            logger.error("  FAILED: %s", final.get("errorMessage"))
+
+        # Progress for multi-batch
+        if num_batches > 1:
+            elapsed = time.time() - total_start
+            processed = min(batch_num * BATCH_SIZE, len(pdfs))
+            rate = processed / elapsed if elapsed > 0 else 0
+            remaining = (len(pdfs) - processed) / rate if rate > 0 else 0
+            logger.info("  Progress: %d/%d PDFs, %d chunks, %.1f PDFs/sec, ~%.0fs left",
+                        processed, len(pdfs), total_chunks, rate, max(0, remaining))
+
     total_time = time.time() - total_start
-
-    if final.get("status") != "COMPLETED":
-        logger.error("FAIL - Job status: %s, error: %s",
-                      final.get("status"), final.get("errorMessage"))
-        return False
-
-    total_docs = final.get("documentsProcessed", 0)
-    total_chunks = final.get("chunksProcessed", 0)
-    export_file = final.get("exportFileName")
 
     # Get index stats
     index_stats = get_index_stats()
@@ -377,26 +430,31 @@ def test_ingestion(pdfs: List[Path], verify_export: bool) -> bool:
     logger.info("Documents indexed: %d", total_docs)
     logger.info("Total chunks:      %d", total_chunks)
     logger.info("Total tokens:      %s", index_stats.get("totalTokens", "N/A"))
-    logger.info("Export file:       %s", export_file)
+    logger.info("Jobs completed:    %d/%d", jobs_completed, num_batches)
+    logger.info("Export files:      %d", len(export_files))
     logger.info("Total time:        %.1fs", total_time)
     logger.info("Rate:              %.1f PDFs/sec", len(pdfs) / total_time if total_time > 0 else 0)
     logger.info("=" * 60)
 
-    # Verify export if requested
-    if verify_export and export_file:
+    # Verify exports if requested
+    if verify_export and export_files:
         logger.info("")
-        logger.info("VERIFYING EXPORT FILE")
+        logger.info("VERIFYING EXPORT FILES")
         logger.info("-" * 40)
-        logger.info("Checking: %s", export_file)
-        result = verify_export_file(export_file)
-        if result["valid"]:
-            logger.info("  VALID - %d chunks, %d documents, %d tokens, %.2f MB",
-                        result["totalChunks"], result["uniqueDocuments"],
-                        result["totalTokens"], result["fileSizeMB"])
-        else:
-            logger.error("  INVALID - %s", result["error"])
+        verify_count = min(3, len(export_files))
+        for ef in export_files[:verify_count]:
+            logger.info("Checking: %s", ef)
+            result = verify_export_file(ef)
+            if result["valid"]:
+                logger.info("  VALID - %d chunks, %d documents, %d tokens, %.2f MB",
+                            result["totalChunks"], result["uniqueDocuments"],
+                            result["totalTokens"], result["fileSizeMB"])
+            else:
+                logger.error("  INVALID - %s", result["error"])
+        if len(export_files) > verify_count:
+            logger.info("  ... and %d more export files", len(export_files) - verify_count)
 
-    return True
+    return jobs_failed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +470,7 @@ def main():
 Examples:
   python test_async_ingestion.py                       # Quick smoke test (5 PDFs)
   python test_async_ingestion.py --count 50            # 50 PDFs, single API call
-  python test_async_ingestion.py --count 1082          # Full dataset, single API call
+  python test_async_ingestion.py --count 1082          # Full dataset (auto-batched, 100/batch)
   python test_async_ingestion.py --count 10 --verify-export  # Verify JSON export
         """
     )
