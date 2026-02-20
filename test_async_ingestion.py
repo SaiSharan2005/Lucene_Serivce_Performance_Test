@@ -44,7 +44,7 @@ CHUNK_STATS_ENDPOINT = f"{BASE_URL}/api/v1/search/chunk-stats"
 
 PDF_SOURCE_PATH = os.path.join(
     os.path.dirname(__file__),
-    "..", "Research-Paper-Downloder", "data", "arxiv", "cs_ai", "pdfs"
+    "..", "Arxiv_Pdf_Feathcer", "data", "arxiv", "cs_ai", "pdfs"
 )
 
 EXPORT_PATH = os.path.join(
@@ -57,7 +57,7 @@ POLL_INTERVAL_SEC = 2
 POLL_TIMEOUT_SEC = 1800  # 30 minutes max per job
 
 # Auto-batching: PDFs per API call (keeps upload size manageable)
-BATCH_SIZE = 100  # ~400 MB per batch (avg 4 MB per PDF)
+DEFAULT_BATCH_SIZE = 100  # ~400 MB per batch (avg 4 MB per PDF)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -338,13 +338,13 @@ def test_single_file(pdfs: List[Path]) -> bool:
         return False
 
 
-def test_ingestion(pdfs: List[Path], verify_export: bool) -> bool:
+def test_ingestion(pdfs: List[Path], verify_export: bool, batch_size: int) -> bool:
     """
     Test: upload PDFs to the async ingestion API.
-    For <= BATCH_SIZE PDFs: single API call → single job → single export.
-    For > BATCH_SIZE PDFs: auto-batched → one job per batch → one export per batch.
+    For <= batch_size PDFs: single API call → single job → single export.
+    For > batch_size PDFs: auto-batched → one job per batch → one export per batch.
     """
-    batches = [pdfs[i:i + BATCH_SIZE] for i in range(0, len(pdfs), BATCH_SIZE)]
+    batches = [pdfs[i:i + batch_size] for i in range(0, len(pdfs), batch_size)]
     num_batches = len(batches)
 
     if num_batches == 1:
@@ -354,7 +354,7 @@ def test_ingestion(pdfs: List[Path], verify_export: bool) -> bool:
     else:
         logger.info("=" * 60)
         logger.info("TEST: Ingest %d PDFs (%d batches of %d)",
-                     len(pdfs), num_batches, BATCH_SIZE)
+                     len(pdfs), num_batches, batch_size)
         logger.info("=" * 60)
 
     total_start = time.time()
@@ -411,7 +411,7 @@ def test_ingestion(pdfs: List[Path], verify_export: bool) -> bool:
         # Progress for multi-batch
         if num_batches > 1:
             elapsed = time.time() - total_start
-            processed = min(batch_num * BATCH_SIZE, len(pdfs))
+            processed = min(batch_num * batch_size, len(pdfs))
             rate = processed / elapsed if elapsed > 0 else 0
             remaining = (len(pdfs) - processed) / rate if rate > 0 else 0
             logger.info("  Progress: %d/%d PDFs, %d chunks, %.1f PDFs/sec, ~%.0fs left",
@@ -472,10 +472,13 @@ Examples:
   python test_async_ingestion.py --count 50            # 50 PDFs, single API call
   python test_async_ingestion.py --count 1082          # Full dataset (auto-batched, 100/batch)
   python test_async_ingestion.py --count 10 --verify-export  # Verify JSON export
+  python test_async_ingestion.py --batch-size 50         # Custom batch size
         """
     )
     parser.add_argument("--count", type=int, default=5,
                         help="Number of PDFs to ingest (default: 5)")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+                        help=f"Number of PDFs per batch (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--verify-export", action="store_true",
                         help="Verify exported JSON file after ingestion")
     parser.add_argument("--skip-validation-tests", action="store_true",
@@ -505,7 +508,7 @@ Examples:
     if args.count == 1:
         results["single_file"] = test_single_file(pdfs)
     else:
-        results["ingestion"] = test_ingestion(pdfs, verify_export=args.verify_export)
+        results["ingestion"] = test_ingestion(pdfs, verify_export=args.verify_export, batch_size=args.batch_size)
 
     # Final report
     print()
